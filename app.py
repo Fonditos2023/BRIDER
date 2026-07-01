@@ -2,7 +2,6 @@ import streamlit as st
 import psycopg2
 import os
 import pandas as pd
-import urllib.parse
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from datetime import date
@@ -10,30 +9,53 @@ from datetime import date
 load_dotenv()
 st.set_page_config(page_title="Brider ERP Mobile", page_icon="🔋", layout="centered")
 
-# --- INYECCIÓN DE ESTILO SERIO E INNOVADOR (CSS CUSTOM) ---
+# --- ESTILOS ---
 st.markdown("""
     <style>
-        /* Tipografía corporativa limpia */
         html, body, [class*="css"] {
             font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
         }
-        /* Botones grandes estilo app móvil premium */
         .stButton>button {
             border-radius: 8px !important;
             padding: 0.6rem 1rem !important;
             font-weight: 600 !important;
         }
-        /* Bordes suavizados de contenedores */
-        div[data-testid="stBlock"] {
-            border-radius: 10px;
-        }
-        /* Limpieza de interfaces innecesarias para pantallas móviles */
         #MainMenu {visibility: hidden;}
         header {visibility: hidden;}
+        .confirm-box {
+            background-color: #f8fafc;
+            border-radius: 16px;
+            padding: 2rem;
+            max-width: 500px;
+            margin: 2rem auto;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .confirm-box h2 {
+            color: #1e293b;
+            margin-bottom: 1rem;
+        }
+        .confirm-box .total {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #0f172a;
+            margin: 1rem 0;
+        }
+        .confirm-box .detail {
+            color: #475569;
+            font-size: 1rem;
+            margin: 0.5rem 0;
+        }
+        .confirm-box .buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-top: 1.5rem;
+        }
     </style>
 """, unsafe_allow_html=True)
 
-# --- INICIALIZACIÓN DE MEMORIA DE SESIÓN (STATE MANAGEMENT) ---
+# --- INICIALIZACIÓN DE SESIÓN ---
 if 'autenticado' not in st.session_state:
     st.session_state.autenticado = False
 if 'usuario_actual' not in st.session_state:
@@ -44,63 +66,78 @@ if 'rol_actual' not in st.session_state:
     st.session_state.rol_actual = None
 if 'carrito' not in st.session_state:
     st.session_state.carrito = []
-if 'venta_preparada' not in st.session_state:
-    st.session_state.venta_preparada = False
 if 'id_venta_generado' not in st.session_state:
     st.session_state.id_venta_generado = None
 if 'ultima_venta' not in st.session_state:
     st.session_state.ultima_venta = None
+if 'vista_confirmacion' not in st.session_state:
+    st.session_state.vista_confirmacion = False   # True = mostrar pantalla de confirmación
+if 'fecha_venta' not in st.session_state:
+    st.session_state.fecha_venta = date.today()
+if 'cliente_seleccionado' not in st.session_state:
+    st.session_state.cliente_seleccionado = None
+if 'tipo_pago' not in st.session_state:
+    st.session_state.tipo_pago = "Contado"
+if 'monto_contado' not in st.session_state:
+    st.session_state.monto_contado = 0.0
+if 'monto_credito' not in st.session_state:
+    st.session_state.monto_credito = 0.0
+if 'medio_cash' not in st.session_state:
+    st.session_state.medio_cash = "Ninguno"
+if 'total_factura' not in st.session_state:
+    st.session_state.total_factura = 0.0
 
-# --- FUNCIONES DE CONEXIÓN A BASE DE DATOS (PATRÓN EFÍMERO ANTICAÍDAS) ---
-def get_db_connection():
+# --- FUNCIONES DE BASE DE DATOS (con caché) ---
+@st.cache_resource
+def init_connection():
     try:
-        # 1. Intenta leer la caja fuerte de la nube (Streamlit Cloud)
         db_url = st.secrets["DATABASE_URL"]
     except Exception:
-        # 2. Si la caja no existe (porque estás en tu PC local), usa tu archivo .env
         db_url = os.getenv("DATABASE_URL")
-        
     return psycopg2.connect(db_url, sslmode="require")
 
-def verificar_login(user, password):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT nombre_apellido, rol FROM usuarios WHERE username = %s AND password_plana = %s;", (user, password))
-    resultado = cursor.fetchone()
-    conn.close()
-    return {"nombre": resultado[0], "rol": resultado[1]} if resultado else None
-
+@st.cache_data(ttl=300)
 def obtener_clientes():
-    conn = get_db_connection()
+    conn = init_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT ruc, razon_social FROM clientes ORDER BY razon_social;")
     filas = cursor.fetchall()
-    conn.close()
+    cursor.close()
     return [f"{fila[0]} | {fila[1]}" for fila in filas]
 
+@st.cache_data(ttl=300)
 def obtener_catalogo_completo():
-    conn = get_db_connection()
+    conn = init_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id_bateria, modelo, tipo, precio_con_igv, stock_actual FROM catalogo_baterias;")
     filas = cursor.fetchall()
-    conn.close()
+    cursor.close()
     return filas
 
+def verificar_login(user, password):
+    conn = init_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT nombre_apellido, rol FROM usuarios WHERE username = %s AND password_plana = %s;", (user, password))
+    resultado = cursor.fetchone()
+    cursor.close()
+    return {"nombre": resultado[0], "rol": resultado[1]} if resultado else None
+
 def guardar_bateria_nueva(modelo, tipo, precio, stock):
-    conn = get_db_connection()
+    conn = init_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT INTO catalogo_baterias (modelo, tipo, precio_con_igv, stock_actual) VALUES (%s, %s, %s, %s);", (modelo, tipo, precio, stock))
         conn.commit()
+        st.cache_data.clear()
         return True
-    except Exception as e:
+    except Exception:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        cursor.close()
 
 def registrar_venta_corporativa_multi(ruc, fecha, tipo_pago, total_general, m_contado, m_credito, vendedor, medio_cash, carrito):
-    conn = get_db_connection()
+    conn = init_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -117,25 +154,24 @@ def registrar_venta_corporativa_multi(ruc, fecha, tipo_pago, total_general, m_co
                 INSERT INTO ventas_detalle (id_venta, id_bateria, cantidad, descuento_porcentaje, subtotal, igv, total_pagar)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
             """, (id_venta, item["id"], item["cantidad"], item["desc_pct"], item["subtotal"], item["igv"], item["total"]))
-
             cursor.execute("UPDATE catalogo_baterias SET stock_actual = stock_actual - %s WHERE id_bateria = %s;", (item["cantidad"], item["id"]))
 
         conn.commit()
+        st.cache_data.clear()
         return id_venta
     except Exception as e:
         conn.rollback()
         st.error(f"Error crítico en transacción: {e}")
         return None
     finally:
-        conn.close()
+        cursor.close()
 
 # =========================================================================
-# CAPA DE CONTROL DE ACCESO (PANTALLA DE LOGIN)
+# LOGIN
 # =========================================================================
 if not st.session_state.autenticado:
     st.markdown("<h3 style='text-align: center; font-weight: 700;'>🔋 GRUPO BRIDER</h3>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center; color: gray;'>Gestión Comercial Móvil</p>", unsafe_allow_html=True)
-    
     with st.form("login_mobile"):
         input_user = st.text_input("Usuario")
         input_pass = st.text_input("Contraseña", type="password")
@@ -152,10 +188,81 @@ if not st.session_state.autenticado:
     st.stop()
 
 # =========================================================================
-# ENTORNO PRINCIPAL (DISEÑO MÓVIL CENTRALIZADO VERTICAL)
+# VISTA DE CONFIRMACIÓN (reemplaza completamente la vista principal)
+# =========================================================================
+if st.session_state.vista_confirmacion:
+    st.markdown("<div style='text-align: center;'>", unsafe_allow_html=True)
+    st.markdown("<h2>📋 Confirmar Venta</h2>", unsafe_allow_html=True)
+    
+    # Resumen de la venta
+    total = st.session_state.total_factura
+    cliente = st.session_state.cliente_seleccionado.split(" | ")[1] if st.session_state.cliente_seleccionado else "No seleccionado"
+    tipo_pago = st.session_state.tipo_pago
+    monto_contado = st.session_state.monto_contado
+    monto_credito = st.session_state.monto_credito
+    medio_cash = st.session_state.medio_cash
+    fecha = st.session_state.fecha_venta.strftime("%d/%m/%Y")
+    
+    st.markdown(f"""
+        <div class="confirm-box">
+            <p class="detail"><strong>Cliente:</strong> {cliente}</p>
+            <p class="detail"><strong>Fecha:</strong> {fecha}</p>
+            <p class="detail"><strong>Método de pago:</strong> {tipo_pago}</p>
+            <p class="detail"><strong>Monto contado:</strong> S/. {monto_contado:.2f}</p>
+            <p class="detail"><strong>Monto crédito:</strong> S/. {monto_credito:.2f}</p>
+            <p class="detail"><strong>Canal cash:</strong> {medio_cash}</p>
+            <div class="total">S/. {total:.2f}</div>
+            <p style="color: #64748b; font-size: 0.9rem;">¿Confirmar el registro de esta venta?</p>
+            <div class="buttons">
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ Confirmar", use_container_width=True, key="confirm_btn"):
+            with st.spinner("Registrando venta..."):
+                ruc_cliente = st.session_state.cliente_seleccionado.split(" | ")[0]
+                id_gen = registrar_venta_corporativa_multi(
+                    ruc_cliente,
+                    st.session_state.fecha_venta,
+                    st.session_state.tipo_pago,
+                    st.session_state.total_factura,
+                    st.session_state.monto_contado,
+                    st.session_state.monto_credito,
+                    st.session_state.nombre_completo,
+                    st.session_state.medio_cash,
+                    st.session_state.carrito
+                )
+                if id_gen:
+                    st.session_state.ultima_venta = {
+                        "id": id_gen,
+                        "cliente": st.session_state.cliente_seleccionado.split(" | ")[1],
+                        "tipo_pago": st.session_state.tipo_pago,
+                        "monto_contado": st.session_state.monto_contado,
+                        "monto_credito": st.session_state.monto_credito,
+                        "medio_pago_cash": st.session_state.medio_cash,
+                        "total": st.session_state.total_factura
+                    }
+                    st.session_state.carrito = []
+                    st.session_state.id_venta_generado = id_gen
+                    st.session_state.vista_confirmacion = False
+                    st.toast("✅ Venta registrada exitosamente", icon="🎉")
+                    st.rerun()
+                else:
+                    st.error("Error al registrar la venta. Intenta nuevamente.")
+                    st.session_state.vista_confirmacion = False
+                    st.rerun()
+    with col2:
+        if st.button("❌ Cancelar", use_container_width=True, key="cancel_btn"):
+            st.session_state.vista_confirmacion = False
+            st.rerun()
+    
+    st.markdown("</div></div></div>", unsafe_allow_html=True)
+    st.stop()
+
+# =========================================================================
+# CONTENIDO PRINCIPAL (solo si NO estamos en confirmación)
 # =========================================================================
 st.markdown(f"<p style='text-align: right; font-size: 0.85rem; color: #666;'>👤 {st.session_state.nombre_completo} ({st.session_state.rol_actual})</p>", unsafe_allow_html=True)
-
 st.title("🛒 Terminal de Ventas")
 
 lista_clientes = obtener_clientes()
@@ -164,26 +271,32 @@ datos_catalogo = obtener_catalogo_completo()
 opciones_baterias = [f"{d[1]} - S/.{d[3]} (Stock: {d[4]})" for d in datos_catalogo]
 diccionario_baterias = {f"{d[1]} - S/.{d[3]} (Stock: {d[4]})": {"id": d[0], "modelo": d[1], "precio": d[3], "stock": d[4]} for d in datos_catalogo}
 
-# --- CONTROL DE VISTAS POR ROLES (RBAC: MÓDULO EXCLUSIVO ADMIN) ---
+# --- PANEL ADMIN ---
 if st.session_state.rol_actual == "Administrador":
     with st.expander("🛠️ Panel Admin: Añadir Batería al Catálogo"):
-        n_modelo = st.text_input("Modelo de Batería (Ej: 15 Placas)")
-        n_tipo = st.selectbox("Tipo de Vehículo", ["Auto", "Moto", "Camión"])
-        n_precio = st.number_input("Precio Venta (Con IGV Incluido)", min_value=0.0, format="%.2f")
-        n_stock = st.number_input("Stock Inicial", min_value=0, step=1)
-        if st.button("Guardar en Catálogo"):
-            if n_modelo and guardar_bateria_nueva(n_modelo, n_tipo, n_precio, n_stock):
-                st.success("Batería agregada exitosamente al catálogo.")
-                st.rerun()
-            else:
-                st.error("Error al registrar producto.")
+        with st.form("add_bateria"):
+            n_modelo = st.text_input("Modelo de Batería (Ej: 15 Placas)")
+            n_tipo = st.selectbox("Tipo de Vehículo", ["Auto", "Moto", "Camión"])
+            n_precio = st.number_input("Precio Venta (Con IGV Incluido)", min_value=0.0, format="%.2f")
+            n_stock = st.number_input("Stock Inicial", min_value=0, step=1)
+            if st.form_submit_button("Guardar en Catálogo"):
+                if n_modelo and guardar_bateria_nueva(n_modelo, n_tipo, n_precio, n_stock):
+                    st.toast("✅ Batería agregada exitosamente", icon="🎉")
+                    st.rerun()
+                else:
+                    st.error("Error al registrar producto.")
 
-# --- SECCIÓN 1: IDENTIFICACIÓN DEL CLIENTE ---
+# --- CLIENTE ---
 cliente_sel = st.selectbox("1. Seleccione el Cliente", lista_clientes)
+st.session_state.cliente_seleccionado = cliente_sel
 st.markdown("---")
 
-# --- SECCIÓN 2: AGREGADOR DINÁMICO (CARRITO DE COMPRAS) ---
+# --- CARRITO ---
 st.subheader("2. Añadir Baterías")
+if not opciones_baterias:
+    st.warning("No hay baterías en el catálogo. Contacte al administrador.")
+    st.stop()
+
 bateria_sel = st.selectbox("Modelo de Batería", opciones_baterias)
 bat_info = diccionario_baterias[bateria_sel]
 
@@ -214,10 +327,10 @@ if st.button("🛒 Añadir al Carrito", use_container_width=True):
             "igv": igv_item,
             "total": t_pagar_item
         })
-        st.success(f"{bat_info['modelo']} añadido.")
+        st.toast(f"✅ {bat_info['modelo']} añadido al carrito", icon="🛒")
         st.rerun()
 
-# --- SECCIÓN 3: MONITOREO DEL CARRITO ACTUAL ---
+# --- DETALLE DEL CARRITO ---
 if st.session_state.carrito:
     st.markdown("### **Detalle del Carrito**")
     df_carrito = pd.DataFrame(st.session_state.carrito)
@@ -225,22 +338,26 @@ if st.session_state.carrito:
     
     if st.button("🗑️ Vaciar Carrito", type="secondary"):
         st.session_state.carrito = []
-        st.session_state.venta_preparada = False
         st.rerun()
         
     st.markdown("---")
 
-    # --- SECCIÓN 4: PARÁMETROS CONTABLES Y MEDIOS DE PAGO ---
+    # --- PARÁMETROS DE PAGO Y FECHA ---
     st.subheader("3. Parámetros de Pago")
     total_factura = sum(item["total"] for item in st.session_state.carrito)
     st.metric(label="TOTAL GENERAL A COBRAR", value=f"S/. {total_factura:.2f}")
 
+    fecha_venta = st.date_input("Fecha de la venta", value=st.session_state.fecha_venta)
+    st.session_state.fecha_venta = fecha_venta
+
     tipo_pago = st.selectbox("Método de Pago", ["Contado", "Crédito", "Mixto"])
-    
+    st.session_state.tipo_pago = tipo_pago
+    st.session_state.total_factura = total_factura
+
     monto_contado = 0.0
     monto_credito = 0.0
     medio_cash_sel = "Ninguno"
-    
+
     if tipo_pago == "Contado":
         monto_contado = total_factura
         medio_cash_sel = st.selectbox("Canal de Recepción Cash", ["Efectivo", "Yape", "Plin", "Visa", "Mastercard", "Transferencia"])
@@ -253,52 +370,18 @@ if st.session_state.carrito:
         if monto_contado > 0:
             medio_cash_sel = st.selectbox("Canal de Recepción Cash (Parte Líquida)", ["Efectivo", "Yape", "Plin", "Visa", "Mastercard", "Transferencia"])
 
+    st.session_state.monto_contado = monto_contado
+    st.session_state.monto_credito = monto_credito
+    st.session_state.medio_cash = medio_cash_sel
+
     st.markdown("---")
 
-    # --- SECCIÓN 5: PROCESAMIENTO CONTABLE CON DOBLE CONFIRMACIÓN ---
-    if not st.session_state.venta_preparada and st.session_state.id_venta_generado is None:
-        if st.button("🚀 Procesar Venta", type="primary", use_container_width=True):
-            st.session_state.venta_preparada = True
-            st.rerun()
+    # --- BOTÓN REGISTRAR VENTA (cambia a vista de confirmación) ---
+    if st.button("🚀 Registrar Venta", type="primary", use_container_width=True):
+        st.session_state.vista_confirmacion = True
+        st.rerun()
 
-    if st.session_state.venta_preparada:
-        st.warning(f"**¿Confirmar registro de venta?** Total de Operación: S/. {total_factura:.2f}")
-        
-        if st.button("Confirmar y Registrar ✅", use_container_width=True):
-            ruc_cliente = cliente_sel.split(" | ")[0]
-            
-            id_gen = registrar_venta_corporativa_multi(
-                ruc_cliente, 
-                date.today(), 
-                tipo_pago, 
-                total_factura,
-                monto_contado, 
-                monto_credito, 
-                st.session_state.nombre_completo, 
-                medio_cash_sel, 
-                st.session_state.carrito
-            )
-            
-            if id_gen:
-                st.session_state.ultima_venta = {
-                    "id": id_gen,
-                    "cliente": cliente_sel.split(" | ")[1],
-                    "tipo_pago": tipo_pago,
-                    "monto_contado": monto_contado,
-                    "monto_credito": monto_credito,
-                    "medio_pago_cash": medio_cash_sel,
-                    "total": total_factura
-                }
-                st.session_state.carrito = [] 
-                st.session_state.venta_preparada = False
-                st.session_state.id_venta_generado = id_gen
-                st.rerun()
-        
-        if st.button("Modificar / Volver atrás", use_container_width=True):
-            st.session_state.venta_preparada = False
-            st.rerun()
-
-# --- SECCIÓN 6: VOUCHER EMITIDO CON DISPARADOR DE COMPARTIR NATIVO ---
+# --- VOUCHER EMITIDO ---
 if st.session_state.id_venta_generado is not None and st.session_state.ultima_venta:
     v = st.session_state.ultima_venta
     st.success("🎉 ¡Operación Registrada Exitosamente!")
@@ -306,7 +389,7 @@ if st.session_state.id_venta_generado is not None and st.session_state.ultima_ve
     ticket_movil = f"""*BRIDER E.I.R.L. - COMPROBANTE*
 ----------------------------------------
 *Doc Nro:* TR-{v['id']:05d}
-*Fecha:* {date.today()}
+*Fecha:* {st.session_state.fecha_venta.strftime('%d/%m/%Y')}
 *Vendedor:* {st.session_state.nombre_completo}
 *Cliente:* {v['cliente']}
 ----------------------------------------
@@ -322,7 +405,7 @@ if st.session_state.id_venta_generado is not None and st.session_state.ultima_ve
     st.code(ticket_movil, language="text")
     ticket_js = ticket_movil.replace("\n", "\\n")
     
-    html_share_button = f"""
+    html_share = f"""
     <button id="nativeShareBtn" style="
         width: 100%;
         background-color: #1E293B;
@@ -342,7 +425,6 @@ if st.session_state.id_venta_generado is not None and st.session_state.ultima_ve
     ">
         🔗 Compartir Comprobante
     </button>
-
     <script>
         const btn = document.getElementById('nativeShareBtn');
         btn.addEventListener('click', async () => {{
@@ -350,21 +432,20 @@ if st.session_state.id_venta_generado is not None and st.session_state.ultima_ve
                 title: 'Comprobante Brider',
                 text: `{ticket_js}`
             }};
-            
             try {{
                 if (navigator.share) {{
                     await navigator.share(shareData);
                 }} else {{
                     navigator.clipboard.writeText(shareData.text);
-                    alert('Texto de la factura copiado al portapapeles de manera segura.');
+                    alert('Texto de la factura copiado al portapapeles.');
                 }}
             }} catch (err) {{
-                console.log('Interrupción o cancelación de compartición:', err);
+                console.log('Cancelado:', err);
             }}
         }});
     </script>
     """
-    components.html(html_share_button, height=55)
+    components.html(html_share, height=55)
     
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("Nueva Transacción 🔁", use_container_width=True):
@@ -372,11 +453,18 @@ if st.session_state.id_venta_generado is not None and st.session_state.ultima_ve
         st.session_state.ultima_venta = None
         st.rerun()
 
-# --- BOTÓN DE CIERRE DE SESIÓN SEGURO ---
+# --- CIERRE DE SESIÓN ---
 st.markdown("<br><br>", unsafe_allow_html=True)
 if st.button("🔒 Cerrar Sesión del Sistema", type="secondary", use_container_width=True):
-    st.session_state.autenticado = False
-    st.session_state.usuario_actual = None
-    st.session_state.nombre_completo = None
-    st.session_state.rol_actual = None
+    for key in ['autenticado', 'usuario_actual', 'nombre_completo', 'rol_actual', 'carrito', 
+                'id_venta_generado', 'ultima_venta', 'vista_confirmacion']:
+        if key in st.session_state:
+            if key == 'usuario_actual':
+                st.session_state[key] = None
+            elif key in ['autenticado', 'vista_confirmacion']:
+                st.session_state[key] = False
+            elif key == 'carrito':
+                st.session_state[key] = []
+            else:
+                st.session_state[key] = None
     st.rerun()
