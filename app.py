@@ -5,53 +5,43 @@ import pandas as pd
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from datetime import date
+import bcrypt   # <--- Importante
 
 load_dotenv()
 st.set_page_config(page_title="Brider ERP Mobile", page_icon="🔋", layout="centered")
 
-# --- ESTILOS ---
+# --- ESTILOS (ligeros) ---
 st.markdown("""
     <style>
-        html, body, [class*="css"] {
-            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-        }
-        .stButton>button {
-            border-radius: 8px !important;
-            padding: 0.6rem 1rem !important;
-            font-weight: 600 !important;
-        }
+        html, body, [class*="css"] { font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+        .stButton>button { border-radius: 8px !important; padding: 0.6rem 1rem !important; font-weight: 600 !important; }
         #MainMenu {visibility: hidden;}
         header {visibility: hidden;}
-        .confirm-box {
-            background-color: #f8fafc;
-            border-radius: 16px;
-            padding: 2rem;
-            max-width: 500px;
-            margin: 2rem auto;
-            text-align: center;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-        }
-        .confirm-box h2 {
-            color: #1e293b;
-            margin-bottom: 1rem;
-        }
-        .confirm-box .total {
-            font-size: 2.5rem;
-            font-weight: 700;
-            color: #0f172a;
-            margin: 1rem 0;
-        }
-        .confirm-box .detail {
-            color: #475569;
-            font-size: 1rem;
-            margin: 0.5rem 0;
-        }
-        .confirm-box .buttons {
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.6);
             display: flex;
-            gap: 1rem;
             justify-content: center;
-            margin-top: 1.5rem;
+            align-items: center;
+            z-index: 9999;
+            backdrop-filter: blur(4px);
+            padding: 1rem;
         }
+        .modal-box {
+            background-color: white;
+            border-radius: 16px;
+            padding: 2rem 2.5rem;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            text-align: center;
+            animation: fadeIn 0.3s ease-out;
+        }
+        @keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+        .modal-box h3 { margin-top: 0; color: #1e293b; font-weight: 700; }
+        .modal-box p { color: #475569; margin: 1rem 0 1.5rem 0; font-size: 1.1rem; }
+        .modal-box .stButton button { min-width: 100px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -70,8 +60,8 @@ if 'id_venta_generado' not in st.session_state:
     st.session_state.id_venta_generado = None
 if 'ultima_venta' not in st.session_state:
     st.session_state.ultima_venta = None
-if 'vista_confirmacion' not in st.session_state:
-    st.session_state.vista_confirmacion = False   # True = mostrar pantalla de confirmación
+if 'mostrar_modal' not in st.session_state:
+    st.session_state.mostrar_modal = False
 if 'fecha_venta' not in st.session_state:
     st.session_state.fecha_venta = date.today()
 if 'cliente_seleccionado' not in st.session_state:
@@ -109,7 +99,8 @@ def obtener_clientes():
 def obtener_catalogo_completo():
     conn = init_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id_bateria, modelo, tipo, precio_con_igv, stock_actual FROM catalogo_baterias;")
+    # Adaptado a la nueva estructura con descripcion y precio_con_igv
+    cursor.execute("SELECT id_bateria, modelo, descripcion, precio_con_igv, stock_actual FROM catalogo_baterias;")
     filas = cursor.fetchall()
     cursor.close()
     return filas
@@ -117,16 +108,31 @@ def obtener_catalogo_completo():
 def verificar_login(user, password):
     conn = init_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT nombre_apellido, rol FROM usuarios WHERE username = %s AND password_plana = %s;", (user, password))
+    cursor.execute("SELECT password_hash, nombre_apellido, rol FROM usuarios WHERE username = %s;", (user,))
     resultado = cursor.fetchone()
     cursor.close()
-    return {"nombre": resultado[0], "rol": resultado[1]} if resultado else None
+    if not resultado:
+        return None
+    hash_almacenado = resultado[0]
+    # Validar que el hash tenga formato bcrypt
+    if not hash_almacenado or not isinstance(hash_almacenado, str) or not hash_almacenado.startswith('$2'):
+        return None
+    try:
+        if bcrypt.checkpw(password.encode('utf-8'), hash_almacenado.encode('utf-8')):
+            return {"nombre": resultado[1], "rol": resultado[2]}
+    except ValueError:
+        return None
+    return None
 
-def guardar_bateria_nueva(modelo, tipo, precio, stock):
+def guardar_bateria_nueva(codigo, modelo, descripcion, piezas, aplicacion, precio_lista, precio_con_igv, stock):
     conn = init_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO catalogo_baterias (modelo, tipo, precio_con_igv, stock_actual) VALUES (%s, %s, %s, %s);", (modelo, tipo, precio, stock))
+        cursor.execute("""
+            INSERT INTO catalogo_baterias 
+            (codigo, modelo, descripcion, piezas_por_caja, aplicacion, precio_lista, precio_con_igv, stock_actual)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        """, (codigo, modelo, descripcion, piezas, aplicacion, precio_lista, precio_con_igv, stock))
         conn.commit()
         st.cache_data.clear()
         return True
@@ -150,11 +156,15 @@ def registrar_venta_corporativa_multi(ruc, fecha, tipo_pago, total_general, m_co
         id_venta = cursor.fetchone()[0]
 
         for item in carrito:
+            # Nota: precio_unitario_sin_igv se puede calcular, aquí lo ponemos como 0 o se obtiene del catálogo
             cursor.execute("""
-                INSERT INTO ventas_detalle (id_venta, id_bateria, cantidad, descuento_porcentaje, subtotal, igv, total_pagar)
-                VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """, (id_venta, item["id"], item["cantidad"], item["desc_pct"], item["subtotal"], item["igv"], item["total"]))
-            cursor.execute("UPDATE catalogo_baterias SET stock_actual = stock_actual - %s WHERE id_bateria = %s;", (item["cantidad"], item["id"]))
+                INSERT INTO ventas_detalle (id_venta, id_bateria, cantidad, descuento_porcentaje, 
+                                            precio_unitario_sin_igv, subtotal, igv, total_pagar)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            """, (id_venta, item["id"], item["cantidad"], item["desc_pct"], 
+                  0.0, item["subtotal"], item["igv"], item["total"]))
+
+            # **El trigger se encarga de actualizar el stock, así que no hacemos UPDATE aquí**
 
         conn.commit()
         st.cache_data.clear()
@@ -188,33 +198,16 @@ if not st.session_state.autenticado:
     st.stop()
 
 # =========================================================================
-# VISTA DE CONFIRMACIÓN (reemplaza completamente la vista principal)
+# MODAL DE CONFIRMACIÓN (si está activo)
 # =========================================================================
-if st.session_state.vista_confirmacion:
-    st.markdown("<div style='text-align: center;'>", unsafe_allow_html=True)
-    st.markdown("<h2>📋 Confirmar Venta</h2>", unsafe_allow_html=True)
-    
-    # Resumen de la venta
-    total = st.session_state.total_factura
-    cliente = st.session_state.cliente_seleccionado.split(" | ")[1] if st.session_state.cliente_seleccionado else "No seleccionado"
-    tipo_pago = st.session_state.tipo_pago
-    monto_contado = st.session_state.monto_contado
-    monto_credito = st.session_state.monto_credito
-    medio_cash = st.session_state.medio_cash
-    fecha = st.session_state.fecha_venta.strftime("%d/%m/%Y")
-    
-    st.markdown(f"""
-        <div class="confirm-box">
-            <p class="detail"><strong>Cliente:</strong> {cliente}</p>
-            <p class="detail"><strong>Fecha:</strong> {fecha}</p>
-            <p class="detail"><strong>Método de pago:</strong> {tipo_pago}</p>
-            <p class="detail"><strong>Monto contado:</strong> S/. {monto_contado:.2f}</p>
-            <p class="detail"><strong>Monto crédito:</strong> S/. {monto_credito:.2f}</p>
-            <p class="detail"><strong>Canal cash:</strong> {medio_cash}</p>
-            <div class="total">S/. {total:.2f}</div>
-            <p style="color: #64748b; font-size: 0.9rem;">¿Confirmar el registro de esta venta?</p>
-            <div class="buttons">
-    """, unsafe_allow_html=True)
+if st.session_state.mostrar_modal:
+    # Ocultar contenido principal y mostrar solo el modal
+    st.markdown("""
+        <div class="modal-overlay">
+            <div class="modal-box">
+                <h3>⚠️ Confirmar venta</h3>
+                <p>Estás a punto de registrar una venta por <strong>S/. {:.2f}</strong>.<br>¿Deseas continuar?</p>
+    """.format(st.session_state.total_factura), unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -244,47 +237,53 @@ if st.session_state.vista_confirmacion:
                     }
                     st.session_state.carrito = []
                     st.session_state.id_venta_generado = id_gen
-                    st.session_state.vista_confirmacion = False
+                    st.session_state.mostrar_modal = False
                     st.toast("✅ Venta registrada exitosamente", icon="🎉")
                     st.rerun()
                 else:
                     st.error("Error al registrar la venta. Intenta nuevamente.")
-                    st.session_state.vista_confirmacion = False
+                    st.session_state.mostrar_modal = False
                     st.rerun()
     with col2:
         if st.button("❌ Cancelar", use_container_width=True, key="cancel_btn"):
-            st.session_state.vista_confirmacion = False
+            st.session_state.mostrar_modal = False
             st.rerun()
     
-    st.markdown("</div></div></div>", unsafe_allow_html=True)
-    st.stop()
+    st.markdown("</div></div>", unsafe_allow_html=True)
+    st.stop()  # Detener para que no se vea el contenido principal
 
 # =========================================================================
-# CONTENIDO PRINCIPAL (solo si NO estamos en confirmación)
+# CONTENIDO PRINCIPAL (solo si no hay modal)
 # =========================================================================
 st.markdown(f"<p style='text-align: right; font-size: 0.85rem; color: #666;'>👤 {st.session_state.nombre_completo} ({st.session_state.rol_actual})</p>", unsafe_allow_html=True)
 st.title("🛒 Terminal de Ventas")
 
+# Obtener datos
 lista_clientes = obtener_clientes()
 datos_catalogo = obtener_catalogo_completo()
 
+# Construir opciones y diccionario para el selectbox
 opciones_baterias = [f"{d[1]} - S/.{d[3]} (Stock: {d[4]})" for d in datos_catalogo]
 diccionario_baterias = {f"{d[1]} - S/.{d[3]} (Stock: {d[4]})": {"id": d[0], "modelo": d[1], "precio": d[3], "stock": d[4]} for d in datos_catalogo}
 
-# --- PANEL ADMIN ---
+# --- PANEL ADMIN (adaptado) ---
 if st.session_state.rol_actual == "Administrador":
     with st.expander("🛠️ Panel Admin: Añadir Batería al Catálogo"):
         with st.form("add_bateria"):
-            n_modelo = st.text_input("Modelo de Batería (Ej: 15 Placas)")
-            n_tipo = st.selectbox("Tipo de Vehículo", ["Auto", "Moto", "Camión"])
-            n_precio = st.number_input("Precio Venta (Con IGV Incluido)", min_value=0.0, format="%.2f")
-            n_stock = st.number_input("Stock Inicial", min_value=0, step=1)
+            n_codigo = st.text_input("Código (Ej: BBR00001)")
+            n_modelo = st.text_input("Modelo (Ej: 12N5-3B)")
+            n_descripcion = st.text_area("Descripción completa")
+            n_piezas = st.number_input("Piezas por caja", min_value=1, step=1, value=1)
+            n_aplicacion = st.text_area("Aplicación (vehículos compatibles)")
+            n_precio_lista = st.number_input("Precio lista (sin IGV)", min_value=0.0, format="%.2f")
+            n_precio_con_igv = st.number_input("Precio con IGV", min_value=0.0, format="%.2f")
+            n_stock = st.number_input("Stock inicial", min_value=0, step=1)
             if st.form_submit_button("Guardar en Catálogo"):
-                if n_modelo and guardar_bateria_nueva(n_modelo, n_tipo, n_precio, n_stock):
+                if n_codigo and n_modelo and guardar_bateria_nueva(n_codigo, n_modelo, n_descripcion, n_piezas, n_aplicacion, n_precio_lista, n_precio_con_igv, n_stock):
                     st.toast("✅ Batería agregada exitosamente", icon="🎉")
                     st.rerun()
                 else:
-                    st.error("Error al registrar producto.")
+                    st.error("Error al registrar producto. Verifica que todos los campos estén llenos.")
 
 # --- CLIENTE ---
 cliente_sel = st.selectbox("1. Seleccione el Cliente", lista_clientes)
@@ -303,6 +302,7 @@ bat_info = diccionario_baterias[bateria_sel]
 cant_input = st.number_input("Cantidad", min_value=1, step=1, value=1)
 desc_input = st.selectbox("Descuento Aplicable", ["10%", "15%", "20%", "0%"], index=0)
 
+# Verificar stock disponible (considerando lo ya agregado al carrito)
 cant_en_carrito = sum(item["cantidad"] for item in st.session_state.carrito if item["id"] == bat_info["id"])
 stock_real_disponible = bat_info["stock"] - cant_en_carrito
 
@@ -347,6 +347,7 @@ if st.session_state.carrito:
     total_factura = sum(item["total"] for item in st.session_state.carrito)
     st.metric(label="TOTAL GENERAL A COBRAR", value=f"S/. {total_factura:.2f}")
 
+    # Fecha
     fecha_venta = st.date_input("Fecha de la venta", value=st.session_state.fecha_venta)
     st.session_state.fecha_venta = fecha_venta
 
@@ -376,9 +377,9 @@ if st.session_state.carrito:
 
     st.markdown("---")
 
-    # --- BOTÓN REGISTRAR VENTA (cambia a vista de confirmación) ---
+    # --- BOTÓN REGISTRAR VENTA ---
     if st.button("🚀 Registrar Venta", type="primary", use_container_width=True):
-        st.session_state.vista_confirmacion = True
+        st.session_state.mostrar_modal = True
         st.rerun()
 
 # --- VOUCHER EMITIDO ---
@@ -457,14 +458,7 @@ if st.session_state.id_venta_generado is not None and st.session_state.ultima_ve
 st.markdown("<br><br>", unsafe_allow_html=True)
 if st.button("🔒 Cerrar Sesión del Sistema", type="secondary", use_container_width=True):
     for key in ['autenticado', 'usuario_actual', 'nombre_completo', 'rol_actual', 'carrito', 
-                'id_venta_generado', 'ultima_venta', 'vista_confirmacion']:
+                'id_venta_generado', 'ultima_venta', 'mostrar_modal']:
         if key in st.session_state:
-            if key == 'usuario_actual':
-                st.session_state[key] = None
-            elif key in ['autenticado', 'vista_confirmacion']:
-                st.session_state[key] = False
-            elif key == 'carrito':
-                st.session_state[key] = []
-            else:
-                st.session_state[key] = None
+            st.session_state[key] = None if key == 'usuario_actual' else False if key in ['autenticado','mostrar_modal'] else []
     st.rerun()
